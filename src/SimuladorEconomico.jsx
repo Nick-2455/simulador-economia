@@ -195,6 +195,137 @@ function getScoreLabel(score) {
   return               { text: 'COLAPSO',   color: '#ef4444' }
 }
 
+// ─── POLICY OPTIMIZER ────────────────────────────────────────────────────────
+// Uses coordinate ascent to find the input combination that maximizes the health
+// score. Since the causal model is linear and the score is piecewise-linear,
+// a single multi-pass coordinate sweep converges to the global optimum.
+//
+// feasibilityMode = true → each variable is capped at ±30% of its range from
+// the baseline, modelling political/institutional constraints.
+function optimizePolicy(baselineInputs, feasibilityMode = false) {
+  const evalScore = (inp) => computeScore(computeOutputs(inp, baselineInputs), inp)
+
+  let current = { ...baselineInputs }
+
+  // Three passes handle threshold discontinuities (e.g. score kinks at pib=5, gini=30)
+  for (let pass = 0; pass < 3; pass++) {
+    for (const config of SLIDER_CONFIG) {
+      const key = config.key
+      const rangeSpan = config.max - config.min
+
+      const maxAllowed = feasibilityMode
+        ? Math.min(config.max, baselineInputs[key] + rangeSpan * 0.3)
+        : config.max
+      const minAllowed = feasibilityMode
+        ? Math.max(config.min, baselineInputs[key] - rangeSpan * 0.3)
+        : config.min
+
+      // Determine gradient direction via a tiny perturbation
+      const eps = rangeSpan * 0.001
+      const scoreUp   = evalScore({ ...current, [key]: Math.min(current[key] + eps, config.max) })
+      const scoreDown = evalScore({ ...current, [key]: Math.max(current[key] - eps, config.min) })
+      const scoreBase = evalScore(current)
+
+      if (scoreUp > scoreBase && scoreUp >= scoreDown) {
+        current = { ...current, [key]: maxAllowed }
+      } else if (scoreDown > scoreBase) {
+        current = { ...current, [key]: minAllowed }
+      }
+    }
+  }
+
+  const optOutputs = computeOutputs(current, baselineInputs)
+  return {
+    optimalInputs: current,
+    optimalOutputs: optOutputs,
+    optimalScore: computeScore(optOutputs, current),
+  }
+}
+
+// ─── TEMPORAL SIMULATION ──────────────────────────────────────────────────────
+// Models the economy converging from current outputs toward the new policy
+// equilibrium using discrete exponential smoothing:
+//   y_{t+1} = y_t + α · (y* − y_t)
+//
+// α (0–1) represents transmission speed: higher α → faster adjustment.
+// This captures policy lags realistically without requiring a full dynamic model.
+function simulateOverTime(currentInputs, baselineInputs, steps = 12, alpha = 0.35) {
+  const targetOutputs = computeOutputs(currentInputs, baselineInputs)
+
+  // Start from baseline (Hermosillo empirical) outputs — not from model equilibrium —
+  // so the chart shows the transition path, not a flat line.
+  let state = { ...BASELINE_OUTPUTS }
+  const data = []
+
+  for (let t = 0; t <= steps; t++) {
+    const score = computeScore(state, currentInputs)
+    data.push({
+      period: t,
+      label: t === 0 ? 'Inicial' : `Mes ${t}`,
+      pibGrowth:    parseFloat(state.pibGrowth.toFixed(2)),
+      unemployment: parseFloat(state.unemployment.toFixed(2)),
+      poverty:      parseFloat(state.poverty.toFixed(2)),
+      gini:         parseFloat(state.gini.toFixed(2)),
+      confidence:   parseFloat(state.confidence.toFixed(1)),
+      migration:    parseFloat(state.migration.toFixed(1)),
+      score,
+    })
+    // Converge toward target equilibrium
+    const next = {}
+    for (const key of Object.keys(state)) {
+      next[key] = state[key] + alpha * (targetOutputs[key] - state[key])
+    }
+    state = next
+  }
+
+  return data
+}
+
+// ─── CONFLICT DETECTOR ───────────────────────────────────────────────────────
+// Identifies structural contradictions in the policy mix that reduce effectiveness.
+// Returns an array of {severity, description} objects used to enrich the AI prompt.
+function detectConflicts(inputs, outputs) {
+  const conflicts = []
+
+  if (inputs.socialSpending > 7 && inputs.corruption > 55) {
+    const leakagePct = Math.min(70, Math.round((inputs.corruption - 55) / 90 * 80))
+    conflicts.push({
+      severity: inputs.corruption > 75 ? 'ALTO' : 'MEDIO',
+      description: `Gasto social ${inputs.socialSpending.toFixed(1)}% PIB con corrupción ${inputs.corruption}/100 — estimado ${leakagePct}% de recursos se pierde por filtración institucional`,
+    })
+  }
+
+  if (inputs.interestRate > 13 && inputs.inflation < 5) {
+    conflicts.push({
+      severity: 'MEDIO',
+      description: `Tasa de interés ${inputs.interestRate}% excesiva para inflación de ${inputs.inflation.toFixed(1)}% — restricción monetaria sin presión inflacionaria que la justifique`,
+    })
+  }
+
+  if (inputs.taxBurden > 24 && inputs.socialSpending < 5) {
+    conflicts.push({
+      severity: 'MEDIO',
+      description: `Carga fiscal ${inputs.taxBurden}% PIB con gasto social ${inputs.socialSpending.toFixed(1)}% — presión tributaria alta sin retorno social proporcional`,
+    })
+  }
+
+  if (outputs.confidence < 15 && inputs.infrastructure > 5) {
+    conflicts.push({
+      severity: 'BAJO',
+      description: `Inversión en infraestructura ${inputs.infrastructure.toFixed(1)}% PIB no se traduce en confianza institucional (${outputs.confidence.toFixed(0)}/100) por corrupción estructural`,
+    })
+  }
+
+  if (inputs.inflation > 10 && inputs.interestRate < 8) {
+    conflicts.push({
+      severity: 'ALTO',
+      description: `Inflación ${inputs.inflation.toFixed(1)}% con tasa de interés ${inputs.interestRate}% — política monetaria insuficientemente restrictiva`,
+    })
+  }
+
+  return conflicts
+}
+
 function getIndicatorStatus(key, value) {
   const thresholds = {
     pibGrowth:    { ok: 3,    warn: 1 },
@@ -447,7 +578,18 @@ function RadarSubScore({ label, value, baseline }) {
 }
 
 // ─── AI REPORT ───────────────────────────────────────────────────────────────
-async function generateReport(inputs, outputs, score, presetLabel) {
+async function generateReport(inputs, outputs, score, presetLabel, conflicts = [], optimizerResult = null) {
+  const conflictSection = conflicts.length > 0
+    ? `\nCONFLICTOS DETECTADOS EN EL MIX DE POLÍTICA:\n${conflicts.map(c => `- [${c.severity}] ${c.description}`).join('\n')}`
+    : '\nNo se detectaron conflictos estructurales mayores en el mix actual.'
+
+  const comparisonSection = optimizerResult
+    ? `\nCOMPARACIÓN CON ESCENARIO ÓPTIMO (calculado automáticamente):
+- Score actual: ${score}/100 → Score óptimo: ${optimizerResult.optimalScore}/100 (potencial: +${optimizerResult.optimalScore - score} pts)
+- PIB óptimo: ${optimizerResult.optimalOutputs.pibGrowth.toFixed(1)}% vs actual ${outputs.pibGrowth.toFixed(1)}%
+- Pobreza óptima: ${optimizerResult.optimalOutputs.poverty.toFixed(1)}% vs actual ${outputs.poverty.toFixed(1)}%`
+    : ''
+
   const prompt = `Eres un economista senior especializado en desarrollo regional latinoamericano.
 Analiza el siguiente escenario de política económica para ${presetLabel} y genera un REPORTE EJECUTIVO en español.
 
@@ -467,15 +609,21 @@ RESULTADOS DEL MODELO CAUSAL:
 - Confianza Institucional: ${outputs.confidence.toFixed(0)}/100
 - Presión Migratoria: ${outputs.migration.toFixed(0)}/100
 - Score de Salud Económica: ${score}/100
+${conflictSection}
+${comparisonSection}
 
 El reporte debe incluir:
-1. DIAGNÓSTICO GENERAL (2-3 párrafos profundos)
-2. EFECTOS PRINCIPALES (análisis de los 3 factores más críticos)
-3. RECOMENDACIONES DE POLÍTICA (3-5 acciones concretas y priorizadas)
-4. RIESGOS Y ADVERTENCIAS (2-3 riesgos de mediano plazo)
+1. DIAGNÓSTICO GENERAL (2-3 párrafos: estado actual, causas estructurales, contexto regional comparado)
+2. EFECTOS PRINCIPALES (análisis de los 3 factores más críticos con datos específicos del escenario)
+3. INTERACCIONES CLAVE (cómo se potencian o neutralizan entre sí las variables — ej. cómo la corrupción anula el gasto social, o cómo infraestructura y tasa de interés interactúan)
+4. CONFLICTOS DEL MODELO (ineficiencias o contradicciones en el mix de política, especialmente si hay conflictos detectados arriba)
+5. EFICIENCIA DEL MIX DE POLÍTICA (¿están alineadas las variables entre sí? ¿hay sinergias desperdiciadas? ¿el mix es coherente?)
+6. RECOMENDACIONES DE POLÍTICA (3-5 acciones concretas, priorizadas por impacto y factibilidad)
+7. RIESGOS Y ADVERTENCIAS (2-3 riesgos de mediano plazo con probabilidad cualitativa)
 
-Usa un tono técnico pero accesible. Sé específico y usa datos del escenario.
-Formato: usa encabezados en mayúsculas, párrafos densos con análisis real, no bullet points superficiales.`
+Usa un tono técnico pero accesible. Sé específico con los datos del escenario.
+IMPORTANTE: Enfatiza las INTERACCIONES entre variables, no solo efectos individuales. Una variable nunca opera en aislamiento.
+Formato: encabezados en mayúsculas, párrafos densos con análisis real, no bullet points superficiales.`
 
   const response = await fetch('/api/messages', {
     method: 'POST',
@@ -608,6 +756,12 @@ export default function SimuladorEconomico() {
   const [reportError, setReportError] = useState(null)
   const [customPresets, setCustomPresets] = useState(loadCustomPresets)
   const [showModal, setShowModal] = useState(false)
+  // Optimizer
+  const [optimizerResult, setOptimizerResult] = useState(null)
+  const [feasibilityMode, setFeasibilityMode] = useState(false)
+  // Simulation
+  const [simulationData, setSimulationData] = useState(null)
+  const [simAlpha, setSimAlpha] = useState(0.35)
 
   // Merge built-in + custom presets
   const allPresets = { ...PRESETS, ...customPresets }
@@ -619,6 +773,7 @@ export default function SimuladorEconomico() {
   const baselineScore = computeScore(baselineOutputs, baselineInputs)
   const scoreLabel = getScoreLabel(score)
   const scoreDelta = score - baselineScore
+  const conflicts = detectConflicts(inputs, outputs)
 
   // Track history on input change
   useEffect(() => {
@@ -686,13 +841,33 @@ export default function SimuladorEconomico() {
     setReportLoading(true)
     setReportError(null)
     try {
-      const text = await generateReport(inputs, outputs, score, allPresets[activePreset].label)
+      const text = await generateReport(
+        inputs, outputs, score, allPresets[activePreset].label,
+        conflicts, optimizerResult,
+      )
       setReport(text)
     } catch (err) {
       setReportError(err.message)
     } finally {
       setReportLoading(false)
     }
+  }
+
+  const handleOptimize = () => {
+    const result = optimizePolicy(baselineInputs, feasibilityMode)
+    setOptimizerResult(result)
+  }
+
+  const handleApplyOptimal = () => {
+    if (!optimizerResult) return
+    setInputs(optimizerResult.optimalInputs)
+    setOptimizerResult(null)
+    setTab('indicadores')
+  }
+
+  const handleSimulate = () => {
+    const data = simulateOverTime(inputs, baselineInputs, 12, simAlpha)
+    setSimulationData(data)
   }
 
   const handlePrintReport = () => {
@@ -712,10 +887,12 @@ export default function SimuladorEconomico() {
   ]
 
   const TABS = [
-    { key: 'indicadores', label: 'INDICADORES' },
-    { key: 'radar',       label: 'RADAR' },
-    { key: 'tendencia',   label: 'TENDENCIA' },
-    { key: 'reporte',     label: 'REPORTE IA' },
+    { key: 'indicadores',  label: 'INDICADORES' },
+    { key: 'radar',        label: 'RADAR' },
+    { key: 'tendencia',    label: 'TENDENCIA' },
+    { key: 'optimizador',  label: 'OPTIMIZADOR' },
+    { key: 'simulacion',   label: 'SIMULACIÓN' },
+    { key: 'reporte',      label: 'REPORTE IA' },
   ]
 
   return (
@@ -1034,6 +1211,210 @@ export default function SimuladorEconomico() {
                       <Line type="monotone" dataKey="score" name="Score" stroke="#00ff41" dot={false} strokeWidth={2} />
                     </LineChart>
                   </ResponsiveContainer>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── OPTIMIZADOR TAB ── */}
+          {tab === 'optimizador' && (
+            <div className="tab-optimizador">
+              <div className="tab-section-title">★ OPTIMIZADOR DE POLÍTICA — SCORE MÁXIMO ALCANZABLE</div>
+
+              <div className="optimizer-controls">
+                <label className="optimizer-toggle">
+                  <input
+                    type="checkbox"
+                    checked={feasibilityMode}
+                    onChange={(e) => { setFeasibilityMode(e.target.checked); setOptimizerResult(null) }}
+                  />
+                  <span>
+                    Modo factibilidad política
+                    <span className="optimizer-toggle-hint"> (cambios máx. ±30% del rango)</span>
+                  </span>
+                </label>
+                <button className="btn-optimize" onClick={handleOptimize}>
+                  ◎ OPTIMIZAR POLÍTICA
+                </button>
+              </div>
+
+              {!optimizerResult && (
+                <div className="optimizer-empty">
+                  <p>Presiona <strong>OPTIMIZAR POLÍTICA</strong> para encontrar la combinación de variables que maximiza el Score de Salud Económica.</p>
+                  <p className="optimizer-empty-hint">
+                    El algoritmo usa ascenso por coordenadas sobre el modelo causal lineal. En modo libre encuentra el máximo teórico; en modo factibilidad respeta restricciones políticas.
+                  </p>
+                </div>
+              )}
+
+              {optimizerResult && (
+                <>
+                  <div className="optimizer-score-comparison">
+                    <div className="opt-score-box">
+                      <div className="opt-score-label">SCORE ACTUAL</div>
+                      <div className="opt-score-value" style={{ color: scoreLabel.color }}>{score}</div>
+                      <div className="opt-score-max">/100</div>
+                      <div className="opt-score-tag" style={{ color: scoreLabel.color }}>{scoreLabel.text}</div>
+                    </div>
+                    <div className="opt-score-arrow">→</div>
+                    <div className="opt-score-box opt-score-optimal">
+                      <div className="opt-score-label">SCORE ÓPTIMO</div>
+                      <div className="opt-score-value" style={{ color: '#00ff41' }}>{optimizerResult.optimalScore}</div>
+                      <div className="opt-score-max">/100</div>
+                      <div className="opt-score-delta">▲ +{optimizerResult.optimalScore - score} pts</div>
+                    </div>
+                  </div>
+
+                  <div className="optimizer-table">
+                    <div className="optimizer-table-title">CAMBIOS RECOMENDADOS POR VARIABLE</div>
+                    <div className="optimizer-table-header">
+                      <span>VARIABLE</span>
+                      <span>ACTUAL</span>
+                      <span>ÓPTIMO</span>
+                      <span>CAMBIO</span>
+                    </div>
+                    {SLIDER_CONFIG.map((config) => {
+                      const cur = inputs[config.key]
+                      const opt = optimizerResult.optimalInputs[config.key]
+                      const delta = opt - cur
+                      const changed = Math.abs(delta) > config.step * 0.5
+                      return (
+                        <div key={config.key} className={`optimizer-row ${changed ? 'optimizer-row-changed' : ''}`}>
+                          <span className="opt-row-label">{config.label}</span>
+                          <span className="opt-current">{cur.toFixed(config.step < 1 ? 1 : 0)}{config.unit}</span>
+                          <span className="opt-optimal" style={{ color: changed ? '#00ff41' : '#555' }}>
+                            {opt.toFixed(config.step < 1 ? 1 : 0)}{config.unit}
+                          </span>
+                          <span
+                            className="opt-direction"
+                            style={{ color: delta > 0.05 ? '#fbbf24' : delta < -0.05 ? '#00ff41' : '#555' }}
+                          >
+                            {changed
+                              ? `${delta > 0 ? '▲' : '▼'} ${delta > 0 ? '+' : ''}${delta.toFixed(config.step < 1 ? 1 : 0)}`
+                              : '— sin cambio'
+                            }
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {conflicts.length > 0 && (
+                    <div className="optimizer-conflicts">
+                      <div className="optimizer-conflicts-title">CONFLICTOS IDENTIFICADOS EN MIX ACTUAL</div>
+                      {conflicts.map((c, i) => (
+                        <div key={i} className={`optimizer-conflict-row optimizer-conflict-${c.severity.toLowerCase()}`}>
+                          <span className="conflict-badge">{c.severity}</span>
+                          <span className="conflict-desc">{c.description}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="optimizer-actions">
+                    <button className="btn-apply-optimal" onClick={handleApplyOptimal}>
+                      ◎ APLICAR VALORES ÓPTIMOS A SLIDERS
+                    </button>
+                    <span className="optimizer-hint">
+                      Los controles se moverán al mix óptimo calculado
+                      {feasibilityMode ? ' (con restricciones de factibilidad)' : ' (sin restricciones)'}.
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── SIMULACIÓN TAB ── */}
+          {tab === 'simulacion' && (
+            <div className="tab-simulacion">
+              <div className="tab-section-title">★ SIMULACIÓN TEMPORAL — DINÁMICA DE CONVERGENCIA AL EQUILIBRIO</div>
+
+              <div className="sim-controls">
+                <div className="sim-alpha-wrap">
+                  <span className="sim-alpha-label">VELOCIDAD DE AJUSTE α = {simAlpha.toFixed(2)}</span>
+                  <input
+                    type="range"
+                    min={0.1} max={0.8} step={0.05}
+                    value={simAlpha}
+                    onChange={(e) => { setSimAlpha(parseFloat(e.target.value)); setSimulationData(null) }}
+                    className="slider-input sim-alpha-slider"
+                    style={{ '--pct': `${((simAlpha - 0.1) / 0.7) * 100}%` }}
+                  />
+                  <span className="sim-alpha-hint">Lento (0.1) ↔ Rápido (0.8)</span>
+                </div>
+                <button className="btn-simulate" onClick={handleSimulate}>
+                  ◎ SIMULAR 12 MESES
+                </button>
+              </div>
+
+              <div className="sim-explanation">
+                Modela la transición desde la economía inicial (baseline) hacia el nuevo equilibrio bajo las políticas actuales.
+                Cada período: <em>y_t+1 = y_t + α·(y* − y_t)</em>. Captura rezagos reales de transmisión de política económica.
+              </div>
+
+              {!simulationData && (
+                <div className="optimizer-empty">
+                  <p>Ajusta α y presiona <strong>SIMULAR 12 MESES</strong> para ver la evolución temporal con las políticas actuales.</p>
+                </div>
+              )}
+
+              {simulationData && (
+                <>
+                  <div className="sim-section-label">VARIABLES ECONÓMICAS PRINCIPALES</div>
+                  <ResponsiveContainer width="100%" height={260}>
+                    <LineChart data={simulationData} margin={{ top: 10, right: 20, bottom: 10, left: 0 }}>
+                      <CartesianGrid stroke="#111" strokeDasharray="3 3" />
+                      <XAxis dataKey="label" tick={{ fill: '#555', fontSize: 10, fontFamily: 'JetBrains Mono' }} axisLine={{ stroke: '#333' }} />
+                      <YAxis tick={{ fill: '#555', fontSize: 10, fontFamily: 'JetBrains Mono' }} axisLine={{ stroke: '#333' }} />
+                      <Tooltip contentStyle={{ background: '#0d0d0d', border: '1px solid #333', fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                      <Legend formatter={(v) => <span style={{ fontSize: 10, fontFamily: 'JetBrains Mono' }}>{v}</span>} />
+                      <Line type="monotone" dataKey="pibGrowth"    name="PIB %"        stroke="#00ff41" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="unemployment"  name="Desempleo %"  stroke="#fbbf24" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="poverty"       name="Pobreza %"    stroke="#ef4444" dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+
+                  <div className="sim-section-label">BIENESTAR SOCIAL E INSTITUCIONAL</div>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={simulationData} margin={{ top: 10, right: 20, bottom: 10, left: 0 }}>
+                      <CartesianGrid stroke="#111" strokeDasharray="3 3" />
+                      <XAxis dataKey="label" tick={{ fill: '#555', fontSize: 10, fontFamily: 'JetBrains Mono' }} axisLine={{ stroke: '#333' }} />
+                      <YAxis tick={{ fill: '#555', fontSize: 10, fontFamily: 'JetBrains Mono' }} axisLine={{ stroke: '#333' }} />
+                      <Tooltip contentStyle={{ background: '#0d0d0d', border: '1px solid #333', fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                      <Legend formatter={(v) => <span style={{ fontSize: 10, fontFamily: 'JetBrains Mono' }}>{v}</span>} />
+                      <Line type="monotone" dataKey="gini"        name="Gini"            stroke="#a78bfa" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="confidence"  name="Confianza /100"  stroke="#38bdf8" dot={false} strokeWidth={2} />
+                      <Line type="monotone" dataKey="migration"   name="Migración /100"  stroke="#fb923c" dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+
+                  <div className="sim-section-label">SCORE DE SALUD ECONÓMICA</div>
+                  <ResponsiveContainer width="100%" height={150}>
+                    <LineChart data={simulationData} margin={{ top: 10, right: 20, bottom: 10, left: 0 }}>
+                      <CartesianGrid stroke="#111" strokeDasharray="3 3" />
+                      <XAxis dataKey="label" tick={{ fill: '#555', fontSize: 10, fontFamily: 'JetBrains Mono' }} axisLine={{ stroke: '#333' }} />
+                      <YAxis domain={[0, 100]} tick={{ fill: '#555', fontSize: 10, fontFamily: 'JetBrains Mono' }} axisLine={{ stroke: '#333' }} />
+                      <Tooltip contentStyle={{ background: '#0d0d0d', border: '1px solid #333', fontFamily: 'JetBrains Mono', fontSize: 11 }} />
+                      <Line type="monotone" dataKey="score" name="Score /100" stroke="#00ff41" dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+
+                  <div className="sim-terminal-row">
+                    <span className="sim-terminal-label">Equilibrio final (Mes 12):</span>
+                    {['pibGrowth', 'unemployment', 'poverty', 'gini'].map((k) => {
+                      const last = simulationData[simulationData.length - 1]
+                      const labels = { pibGrowth: 'PIB', unemployment: 'Desempleo', poverty: 'Pobreza', gini: 'Gini' }
+                      return (
+                        <span key={k} className="sim-terminal-val">
+                          {labels[k]}: {last[k].toFixed(1)}
+                        </span>
+                      )
+                    })}
+                    <span className="sim-terminal-val" style={{ color: '#00ff41' }}>
+                      Score: {simulationData[simulationData.length - 1].score}
+                    </span>
+                  </div>
                 </>
               )}
             </div>

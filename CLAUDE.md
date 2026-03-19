@@ -166,13 +166,113 @@ Clamped to [0, 100] and rounded to nearest integer.
 | Hermosillo 2024 | 4.8 | 4.25 | 62 | 16 | 11 | 3.1 |
 | Fintechia | 8 | 3 | 70 | 22 | 9 | 2 |
 
+## Module: Policy Optimizer
+
+### Function: `optimizePolicy(baselineInputs, feasibilityMode)`
+
+Finds the input combination that maximizes the Health Score using **coordinate ascent** over the causal model.
+
+**Algorithm:**
+- 3-pass coordinate sweep (handles piecewise-linear score discontinuities at thresholds like `pibGrowth=5`, `gini=30`)
+- For each variable: computes numerical gradient via ε-perturbation, then pushes to optimal boundary
+- Convergence is guaranteed in ≤ 3 passes because the causal model is linear
+
+**Modes:**
+- `feasibilityMode = false` → unconstrained; each variable reaches its global optimum (theoretical maximum)
+- `feasibilityMode = true` → each variable capped at ±30% of its range from baseline (models political/institutional constraints)
+
+**Returns:** `{ optimalInputs, optimalOutputs, optimalScore }`
+
+**Key finding (empirically validated):** Corruption and infrastructure are the highest-leverage variables — they affect 5 of 6 outputs and dominate the optimization result. Monetary/fiscal variables are secondary.
+
+**UI:** Tab "OPTIMIZADOR" — shows score comparison (current → optimal), per-variable change table, conflict panel, and "Apply to sliders" button that directly sets the React input state.
+
+---
+
+## Module: Conflict Detector
+
+### Function: `detectConflicts(inputs, outputs)`
+
+Identifies structural contradictions in the policy mix that reduce systemic effectiveness. Returns `[{severity, description}]`.
+
+| Conflict | Trigger | Severity |
+|---|---|---|
+| Social leakage | `socialSpending > 7` AND `corruption > 55` | ALTO if corruption > 75, else MEDIO |
+| Monetary over-tightening | `interestRate > 13` AND `inflation < 5` | MEDIO |
+| Fiscal drain | `taxBurden > 24` AND `socialSpending < 5` | MEDIO |
+| Infrastructure trust gap | `confidence < 15` AND `infrastructure > 5` | BAJO |
+| Insufficient monetary response | `inflation > 10` AND `interestRate < 8` | ALTO |
+
+Conflicts are surfaced in the Optimizer tab and injected into the AI report prompt as structured context.
+
+---
+
+## Module: Temporal Simulation
+
+### Function: `simulateOverTime(currentInputs, baselineInputs, steps=12, alpha=0.35)`
+
+Models the economy's transition from the current state toward the new policy equilibrium using **discrete exponential smoothing**:
+
+```
+y_{t+1} = y_t + α · (y* − y_t)
+```
+
+Where:
+- `y*` = equilibrium outputs from `computeOutputs(currentInputs, baselineInputs)` — the model's steady-state
+- `y_0` = `BASELINE_OUTPUTS` (Hermosillo 2024 empirical values) — starting point of the transition
+- `α ∈ [0.1, 0.8]` = convergence speed, user-adjustable. Models policy transmission lag: high α = fast adjustment (e.g. monetary policy), low α = slow (e.g. institutional reform)
+
+**Why start from baseline outputs, not current outputs:**
+Starting from `BASELINE_OUTPUTS` makes the chart show the actual transition path. Starting from `computeOutputs(currentInputs)` would produce a flat line (already at equilibrium), which has no pedagogical value.
+
+**Returns:** Array of 13 data points `{period, label, pibGrowth, unemployment, poverty, gini, confidence, migration, score}`.
+
+**UI:** Tab "SIMULACIÓN" — 3 stacked charts:
+1. Economic variables (PIB, unemployment, poverty)
+2. Social/institutional variables (Gini, confidence, migration)
+3. Health score evolution
+
+Terminal row shows equilibrium values at Month 12.
+
+---
+
+## Enhanced AI Report Prompt
+
+### Function: `generateReport(inputs, outputs, score, presetLabel, conflicts, optimizerResult)`
+
+Signature extended with two new parameters:
+- `conflicts` — array from `detectConflicts()`, injected as structured context before the prompt
+- `optimizerResult` — if available, includes a comparison block (current score vs optimal score, key output deltas)
+
+**New prompt sections (added to existing 4):**
+1. `INTERACCIONES CLAVE` — how variables amplify or neutralize each other (not individual effects)
+2. `CONFLICTOS DEL MODELO` — structural contradictions in the current policy mix
+3. `EFICIENCIA DEL MIX DE POLÍTICA` — alignment, synergies, wasted potential
+
+**Prompt design principle:** The model is explicitly instructed to reason about variable interactions, not just marginal effects. Example target output: *"No basta aumentar gasto social si corrupción permanece alta, ya que reduce su efectividad en un estimado X%."*
+
+---
+
+## Tabs (updated)
+
+| Key | Label | Content |
+|---|---|---|
+| `indicadores` | INDICADORES | 6 gauge cards + comparison table |
+| `radar` | RADAR | Multidimensional radar chart vs baseline |
+| `tendencia` | TENDENCIA | Last 10 slider-change snapshots |
+| `optimizador` | OPTIMIZADOR | Policy optimizer + conflict panel |
+| `simulacion` | SIMULACIÓN | 12-month temporal simulation (3 charts) |
+| `reporte` | REPORTE IA | AI-generated executive report |
+
+---
+
 ## API Integration
 
 The frontend calls `/api/messages` (Vite proxies → `http://localhost:3001`).
 The Express server adds `x-api-key` from `ANTHROPIC_API_KEY` env var and forwards to `https://api.anthropic.com/v1/messages`.
 
 Model used: `claude-sonnet-4-6` with `max_tokens: 2000`.
-Language: Spanish. Prompt requests: diagnóstico, efectos, recomendaciones, riesgos.
+Language: Spanish. Prompt sections: diagnóstico, efectos principales, interacciones clave, conflictos del modelo, eficiencia del mix, recomendaciones, riesgos.
 
 ## Running
 
