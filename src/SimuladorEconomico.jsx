@@ -170,7 +170,7 @@ function computeOutputs(inputs, baselineInputs) {
   return result
 }
 
-function computeScore(outputs, inputs) {
+function computeScore(outputs, inputs, round = true) {
   const pibPenalty       = Math.max(0, 5 - outputs.pibGrowth) * 2.5
   const unemployPenalty  = Math.max(0, outputs.unemployment - 5) * 1.5
   const povertyPenalty   = outputs.poverty * 0.2
@@ -179,12 +179,11 @@ function computeScore(outputs, inputs) {
   const migrationPenalty = Math.max(0, outputs.migration - 5) * 0.3
   const inflationPenalty = Math.max(0, inputs.inflation - 3) * 0.4
 
-  return Math.round(
-    Math.min(100, Math.max(0,
-      100 - pibPenalty - unemployPenalty - povertyPenalty
-          - giniPenalty + confBonus - migrationPenalty - inflationPenalty
-    ))
-  )
+  const raw = Math.min(100, Math.max(0,
+    100 - pibPenalty - unemployPenalty - povertyPenalty
+        - giniPenalty + confBonus - migrationPenalty - inflationPenalty
+  ))
+  return round ? Math.round(raw) : raw
 }
 
 function getScoreLabel(score) {
@@ -201,11 +200,11 @@ function getScoreLabel(score) {
 // a single multi-pass coordinate sweep converges to the global optimum.
 //
 // feasibilityMode = true → each variable is capped at ±30% of its range from
-// the baseline, modelling political/institutional constraints.
-function optimizePolicy(baselineInputs, feasibilityMode = false) {
-  const evalScore = (inp) => computeScore(computeOutputs(inp, baselineInputs), inp)
+// the current inputs, modelling political/institutional constraints.
+function optimizePolicy(currentInputs, baselineInputs, feasibilityMode = false) {
+  const evalScore = (inp) => computeScore(computeOutputs(inp, baselineInputs), inp, false)
 
-  let current = { ...baselineInputs }
+  let current = { ...currentInputs }
 
   // Three passes handle threshold discontinuities (e.g. score kinks at pib=5, gini=30)
   for (let pass = 0; pass < 3; pass++) {
@@ -214,10 +213,10 @@ function optimizePolicy(baselineInputs, feasibilityMode = false) {
       const rangeSpan = config.max - config.min
 
       const maxAllowed = feasibilityMode
-        ? Math.min(config.max, baselineInputs[key] + rangeSpan * 0.3)
+        ? Math.min(config.max, currentInputs[key] + rangeSpan * 0.3)
         : config.max
       const minAllowed = feasibilityMode
-        ? Math.max(config.min, baselineInputs[key] - rangeSpan * 0.3)
+        ? Math.max(config.min, currentInputs[key] - rangeSpan * 0.3)
         : config.min
 
       // Determine gradient direction via a tiny perturbation
@@ -854,7 +853,7 @@ export default function SimuladorEconomico() {
   }
 
   const handleOptimize = () => {
-    const result = optimizePolicy(baselineInputs, feasibilityMode)
+    const result = optimizePolicy(inputs, baselineInputs, feasibilityMode)
     setOptimizerResult(result)
   }
 
