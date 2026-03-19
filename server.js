@@ -15,10 +15,11 @@ try {
 }
 
 const app = express()
-const PORT = 3001
+const PORT = process.env.PORT || 3001
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1'
+const isProd = process.env.NODE_ENV === 'production'
 
-app.use(cors({ origin: 'http://localhost:5173' }))
+app.use(cors({ origin: isProd ? true : 'http://localhost:5173' }))
 app.use(express.json())
 
 // ── Proxy: POST /api/messages → Anthropic /v1/messages ──────────────────────
@@ -60,7 +61,19 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', keyConfigured: !!process.env.ANTHROPIC_API_KEY })
 })
 
+// ── Static frontend (production) ──────────────────────────────────────────────
+// In production Railway serves both the API proxy and the Vite build from one
+// process. The /api routes above take priority; everything else falls through
+// to the SPA's index.html (client-side routing).
+if (isProd) {
+  const distPath = join(__dirname, 'dist')
+  app.use(express.static(distPath))
+  app.get('*', (_req, res) => {
+    res.sendFile(join(distPath, 'index.html'))
+  })
+}
+
 app.listen(PORT, () => {
-  console.log(`[proxy] Anthropic proxy running at http://localhost:${PORT}`)
-  console.log(`[proxy] API key: ${process.env.ANTHROPIC_API_KEY ? '✓ configured' : '✗ missing — set ANTHROPIC_API_KEY in .env'}`)
+  console.log(`[proxy] Anthropic proxy running on port ${PORT} (${isProd ? 'production' : 'development'})`)
+  console.log(`[proxy] API key: ${process.env.ANTHROPIC_API_KEY ? '✓ configured' : '✗ missing — set ANTHROPIC_API_KEY'}`)
 })

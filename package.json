@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"node server.js\"",
     "build": "vite build",
+    "start": "NODE_ENV=production node server.js",
     "preview": "vite preview",
     "server": "node server.js"
   },
