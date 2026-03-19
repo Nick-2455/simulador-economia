@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -524,7 +524,80 @@ function ReportContent({ text }) {
   )
 }
 
+// ─── NEW SCENARIO MODAL ───────────────────────────────────────────────────────
+function NewScenarioModal({ allPresets, currentInputs, onSave, onClose }) {
+  const [name, setName] = useState('')
+  const [copyFrom, setCopyFrom] = useState('__current__')
+  const nameRef = useRef(null)
+
+  useEffect(() => { nameRef.current?.focus() }, [])
+
+  const handleSubmit = (e) => {
+    e.preventDefault()
+    const trimmed = name.trim()
+    if (!trimmed) return
+    const baseInputs = copyFrom === '__current__'
+      ? currentInputs
+      : allPresets[copyFrom]?.inputs ?? currentInputs
+    onSave(trimmed, { ...baseInputs })
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <span className="modal-title">+ NUEVO ESCENARIO</span>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div className="modal-field">
+            <label className="modal-label">NOMBRE DEL ESCENARIO</label>
+            <input
+              ref={nameRef}
+              className="modal-input"
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Ej: Ciudad de México 2025"
+              maxLength={40}
+            />
+          </div>
+          <div className="modal-field">
+            <label className="modal-label">VALORES DE PARTIDA</label>
+            <select
+              className="modal-select"
+              value={copyFrom}
+              onChange={(e) => setCopyFrom(e.target.value)}
+            >
+              <option value="__current__">Usar valores actuales</option>
+              {Object.entries(allPresets).map(([key, preset]) => (
+                <option key={key} value={key}>Copiar de: {preset.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="modal-btn-cancel" onClick={onClose}>Cancelar</button>
+            <button type="submit" className="modal-btn-save" disabled={!name.trim()}>
+              Guardar escenario
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 // ─── MAIN COMPONENT ──────────────────────────────────────────────────────────
+const STORAGE_KEY = 'sim-custom-presets'
+
+function loadCustomPresets() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}')
+  } catch {
+    return {}
+  }
+}
+
 export default function SimuladorEconomico() {
   const [activePreset, setActivePreset] = useState('hermosillo')
   const [inputs, setInputs] = useState(PRESETS.hermosillo.inputs)
@@ -533,8 +606,13 @@ export default function SimuladorEconomico() {
   const [report, setReport] = useState(null)
   const [reportLoading, setReportLoading] = useState(false)
   const [reportError, setReportError] = useState(null)
+  const [customPresets, setCustomPresets] = useState(loadCustomPresets)
+  const [showModal, setShowModal] = useState(false)
 
-  const baselineInputs = PRESETS[activePreset].inputs
+  // Merge built-in + custom presets
+  const allPresets = { ...PRESETS, ...customPresets }
+
+  const baselineInputs = allPresets[activePreset]?.inputs ?? PRESETS.hermosillo.inputs
   const outputs = computeOutputs(inputs, baselineInputs)
   const baselineOutputs = computeOutputs(baselineInputs, baselineInputs)
   const score = computeScore(outputs, inputs)
@@ -562,11 +640,39 @@ export default function SimuladorEconomico() {
     setInputs((prev) => ({ ...prev, [key]: value }))
   }, [])
 
+  // Persist custom presets to localStorage
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(customPresets))
+  }, [customPresets])
+
   const handlePresetChange = (presetKey) => {
     setActivePreset(presetKey)
-    setInputs(PRESETS[presetKey].inputs)
+    setInputs(allPresets[presetKey].inputs)
     setReport(null)
     setReportError(null)
+  }
+
+  const handleSavePreset = (label, presetInputs) => {
+    const key = `custom_${Date.now()}`
+    const newPreset = { label, inputs: presetInputs }
+    setCustomPresets((prev) => ({ ...prev, [key]: newPreset }))
+    setActivePreset(key)
+    setInputs(presetInputs)
+    setReport(null)
+    setReportError(null)
+    setShowModal(false)
+  }
+
+  const handleDeletePreset = (key) => {
+    setCustomPresets((prev) => {
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+    if (activePreset === key) {
+      setActivePreset('hermosillo')
+      setInputs(PRESETS.hermosillo.inputs)
+    }
   }
 
   const handleResetToBaseline = () => {
@@ -580,7 +686,7 @@ export default function SimuladorEconomico() {
     setReportLoading(true)
     setReportError(null)
     try {
-      const text = await generateReport(inputs, outputs, score, PRESETS[activePreset].label)
+      const text = await generateReport(inputs, outputs, score, allPresets[activePreset].label)
       setReport(text)
     } catch (err) {
       setReportError(err.message)
@@ -619,7 +725,7 @@ export default function SimuladorEconomico() {
         <div className="sim-header-left">
           <h1 className="sim-title">SIMULADOR DE POLÍTICA ECONÓMICA</h1>
           <p className="sim-subtitle">
-            MODELO CAUSAL &nbsp;·&nbsp; REFERENCIA: {PRESETS[activePreset].label.toUpperCase()} &nbsp;·&nbsp; COEFICIENTES FMI/BANCO MUNDIAL
+            MODELO CAUSAL &nbsp;·&nbsp; REFERENCIA: {allPresets[activePreset]?.label.toUpperCase()} &nbsp;·&nbsp; COEFICIENTES FMI/BANCO MUNDIAL
           </p>
         </div>
         <div className="sim-header-right">
@@ -645,6 +751,7 @@ export default function SimuladorEconomico() {
       <div className="preset-bar">
         <span className="preset-label">CIUDAD / ESCENARIO:</span>
         <div className="preset-buttons">
+          {/* Built-in presets */}
           {Object.entries(PRESETS).map(([key, preset]) => (
             <button
               key={key}
@@ -654,8 +761,40 @@ export default function SimuladorEconomico() {
               {preset.label}
             </button>
           ))}
+          {/* Custom presets */}
+          {Object.entries(customPresets).map(([key, preset]) => (
+            <div key={key} className={`preset-chip ${activePreset === key ? 'preset-chip-active' : ''}`}>
+              <button
+                className="preset-chip-label"
+                onClick={() => handlePresetChange(key)}
+              >
+                {preset.label}
+              </button>
+              <button
+                className="preset-chip-delete"
+                onClick={() => handleDeletePreset(key)}
+                title="Eliminar escenario"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          {/* Add button */}
+          <button className="preset-btn-add" onClick={() => setShowModal(true)}>
+            + Nuevo
+          </button>
         </div>
       </div>
+
+      {/* ── NEW SCENARIO MODAL ── */}
+      {showModal && (
+        <NewScenarioModal
+          allPresets={allPresets}
+          currentInputs={inputs}
+          onSave={handleSavePreset}
+          onClose={() => setShowModal(false)}
+        />
+      )}
 
       {/* ── HEALTH SCORE BAR ── */}
       <div className="score-bar">
@@ -944,7 +1083,7 @@ export default function SimuladorEconomico() {
                 <div id="print-report">
                   <div className="print-only print-header">
                     <h1>SIMULADOR DE POLÍTICA ECONÓMICA</h1>
-                    <p>Escenario: {PRESETS[activePreset].label} · Score: {score}/100 · {scoreLabel.text}</p>
+                    <p>Escenario: {allPresets[activePreset]?.label} · Score: {score}/100 · {scoreLabel.text}</p>
                   </div>
                   <ReportContent text={report} />
                 </div>
