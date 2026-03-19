@@ -1,0 +1,9 @@
+/* Global reset — component-specific styles are in SimuladorEconomico.css */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #0a0a0a;
+}
